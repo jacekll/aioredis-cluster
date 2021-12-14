@@ -13,10 +13,10 @@ from typing import (
     Union,
 )
 
-from aioredis.util import _converters, decode
+from aioredis_cluster.vendor.aioredis.util import _converters, decode
 
 
-__all__ = [
+__all__ = (
     "ensure_bytes",
     "iter_ensure_bytes",
     "ensure_str",
@@ -29,7 +29,7 @@ __all__ = [
     "parse_moved_response_error",
     "retry_backoff",
     "unused_port",
-]
+)
 
 _T = TypeVar("_T")
 

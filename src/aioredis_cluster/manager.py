@@ -4,6 +4,8 @@ from contextlib import suppress
 from operator import attrgetter
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import async_timeout
+
 from aioredis_cluster.cluster_state import ClusterState, _ClusterStateData
 from aioredis_cluster.command_info import (
     CommandsRegistry,
@@ -86,6 +88,7 @@ def create_cluster_state(slots_resp: SlotsResponse) -> ClusterState:
 
 class ClusterManager:
     STATE_RELOAD_INTERVAL = 300.0
+    EXECUTE_TIMEOUT = 5.0
 
     def __init__(
         self,
@@ -94,6 +97,7 @@ class ClusterManager:
         *,
         state_reload_interval: float = None,
         follow_cluster: bool = None,
+        execute_timeout: float = None,
     ) -> None:
         self._startup_nodes = list(startup_nodes)
         self._pooler = pooler
@@ -105,6 +109,16 @@ class ClusterManager:
         if follow_cluster is None:
             follow_cluster = False
         self._follow_cluster = follow_cluster
+
+        if execute_timeout is None:
+            execute_timeout = self.EXECUTE_TIMEOUT
+        elif execute_timeout < 0:
+            raise ValueError("execute_timeout cannot be negative")
+
+        if execute_timeout > self._reload_interval:
+            execute_timeout = self._reload_interval
+
+        self._execute_timeout = execute_timeout
 
         self._reload_count = 0
         self._reload_event = asyncio.Event()
@@ -136,27 +150,38 @@ class ClusterManager:
                 await self._reloader_task
 
     async def _load_slots(self, addrs: Sequence[Address]) -> SlotsResponse:
-        first_err: Optional[Exception] = None
+        first_err: Optional[BaseException] = None
+
+        if len(addrs) > 10:
+            # choose first ten addrs
+            # addrs probable randomized
+            addrs = addrs[: max(10, len(addrs) // 2)]
 
         logger.debug("Trying to obtain cluster slots from addrs: %r", addrs)
 
         # get first successful cluster slots response
         for addr in addrs:
+            logger.info("Obtain cluster slots from %s", addr)
             try:
                 pool = await self._pooler.ensure_pool(addr)
-                slots_resp = await pool.execute(b"CLUSTER", b"SLOTS", encoding="utf-8")
+                async with async_timeout.timeout(self._execute_timeout):
+                    slots_resp = await pool.execute(b"CLUSTER", b"SLOTS", encoding="utf-8")
+            except asyncio.TimeoutError as e:
+                if first_err is None:
+                    first_err = e
+                logger.warning("Getting cluster slots from %s is timed out", addr)
+                continue
             except Exception as e:
                 if first_err is None:
                     first_err = e
                 logger.warning("Unable to get cluster slots from %s: %r", addr, e)
                 continue
-
             logger.debug("Cluster slots successful loaded from %s: %r", addr, slots_resp)
 
             break
         else:
             if first_err is not None:
-                logger.error("No available hosts to load cluster slots")
+                logger.error("No available hosts to load cluster slots. Tried hosts: %r", addrs)
                 raise first_err
 
         return slots_resp
@@ -217,7 +242,8 @@ class ClusterManager:
         pool = await self._pooler.ensure_pool(state.random_master().addr)
         # fetch commands only for first cluster state load
         if reload_id == 1:
-            raw_commands = await pool.execute(b"COMMAND", encoding="utf-8")
+            async with async_timeout.timeout(self._execute_timeout):
+                raw_commands = await pool.execute(b"COMMAND", encoding="utf-8")
             commands = create_registry(raw_commands)
             logger.debug("Found %d supported commands in cluster", commands.size())
 
