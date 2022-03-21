@@ -16,6 +16,7 @@ from typing import (
 )
 
 from aioredis import Redis, create_pool
+
 from aioredis.errors import ProtocolError, ReplyError
 from async_timeout import timeout as atimeout
 
@@ -65,6 +66,19 @@ __all__ = (
 )
 
 
+
+class PoolFactory:
+    def __init__(self, default_pool_opts: Optional[Dict[str, Any]] = None):
+        if default_pool_opts is None:
+            default_pool_opts = {}
+        self._default_pool_opts: Dict[str, Any] = default_pool_opts
+
+    async def create_pool(self, addr: AioredisAddress, opts: Dict[str, Any] = None, *args, **kwargs) -> AbcPool:
+        pool = await create_pool(addr, **{**self._default_pool_opts, **kwargs})
+
+        return pool
+
+
 class Cluster(AbcCluster):
     _connection_errors = network_errors + closed_errors + (asyncio.TimeoutError,)
 
@@ -100,6 +114,7 @@ class Cluster(AbcCluster):
         commands_factory: CommandsFactory = None,
         connect_timeout: float = None,
         pool_cls: Type[AbcPool] = None,
+        pool_opts: Optional[Dict[str, Any]] = None
     ) -> None:
         if len(startup_nodes) < 1:
             raise ValueError("startup_nodes must be one at least")
@@ -169,6 +184,7 @@ class Cluster(AbcCluster):
             pool_cls = ConnectionsPool
         self._pool_cls = pool_cls
 
+        self._pool_factory = PoolFactory(pool_opts)
         self._pooler = Pooler(self._create_default_pool, reap_frequency=idle_connection_timeout)
 
         self._manager = ClusterManager(
@@ -480,12 +496,15 @@ class Cluster(AbcCluster):
         *,
         minsize: int = None,
         maxsize: int = None,
+        pool_opts: Dict[str, Any] = None,
     ) -> Redis:
         state = await self._manager.get_state()
         if state.has_addr(addr) is False:
             raise ValueError(f"Unknown node address {addr}")
 
-        opts: Dict[str, Any] = {}
+        if pool_opts is None:
+            pool_opts = {}
+        opts: Dict[str, Any] = pool_opts
         if minsize is not None:
             opts["minsize"] = minsize
         if maxsize is not None:
@@ -742,7 +761,7 @@ class Cluster(AbcCluster):
             create_connection_timeout=self._connect_timeout,
         )
 
-        pool = await create_pool(addr, **{**default_opts, **opts})
+        pool = await self._pool_factory.create_pool(addr, **{**default_opts, **opts})
 
         return pool
 
